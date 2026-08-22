@@ -52,8 +52,8 @@ const folder = (name, items) => ({ name, item: items })
 
 const collection = {
     info: {
-        name: "StreamForge API",
-        description: "StreamForge backend - video upload/streaming platform. Set `baseUrl` and log in via Users > Login User to auto-populate `accessToken`.",
+        name: "Velora API",
+        description: "Velora backend - video upload/streaming platform. Set `baseUrl` and log in via Users > Login User to auto-populate `accessToken`.",
         schema: "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
     },
     auth: {
@@ -216,7 +216,7 @@ const collection = {
     ],
 }
 
-const outPath = path.resolve("postman", "StreamForge.postman_collection.json")
+const outPath = path.resolve("postman", "Velora.postman_collection.json")
 fs.mkdirSync(path.dirname(outPath), { recursive: true })
 fs.writeFileSync(outPath, JSON.stringify(collection, null, 2))
 console.log(`Wrote ${outPath}`)

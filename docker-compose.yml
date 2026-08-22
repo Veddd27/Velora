@@ -3,6 +3,13 @@
 # on purpose - it's a cloud (Atlas) database, so containers just reach out to
 # it over the internet using the existing MONGODB_URI from .env.
 
+# Pins the project name explicitly, so container names stay "velora-*"
+# regardless of what the containing folder is called - otherwise Compose
+# derives the name from the folder, and renaming the folder later silently
+# creates a whole second set of containers (which is exactly what happened
+# during this project's own folder cleanup).
+name: velora
+
 services:
   redis:
     image: redis:alpine

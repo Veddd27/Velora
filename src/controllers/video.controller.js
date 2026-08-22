@@ -259,18 +259,22 @@ const getVideoById = asyncHandler(async (req, res) => {
     await setCached(cacheKey, videoData, 60);
   }
 
-  // The personal part: never cached, always computed fresh for whoever is asking.
-  const isLiked = req.user
-    ? Boolean(await Like.exists({ video: videoId, likedBy: req.user._id }))
-    : false;
-  const isSubscribed = req.user
-    ? Boolean(
-        await Subscription.exists({
+  // The personal part: never cached, always computed fresh for whoever is
+  // asking. These two checks don't depend on each other, so they run
+  // concurrently instead of one after another - each is a separate network
+  // round-trip to MongoDB, and there's no reason to pay that cost twice in a
+  // row when it can be paid once, in parallel.
+  const [isLiked, isSubscribed] = await Promise.all([
+    req.user
+      ? Like.exists({ video: videoId, likedBy: req.user._id }).then(Boolean)
+      : Promise.resolve(false),
+    req.user
+      ? Subscription.exists({
           subscriber: req.user._id,
           channel: videoData.owner._id,
-        })
-      )
-    : false;
+        }).then(Boolean)
+      : Promise.resolve(false),
+  ]);
 
   const responseVideo = {
     ...videoData,
