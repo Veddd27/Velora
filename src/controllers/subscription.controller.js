@@ -4,6 +4,7 @@ import { Subscription } from "../models/subscription.model.js"
 import {ApiError} from "../utils/ApiError.js"
 import {ApiResponse} from "../utils/ApiResponse.js"
 import {asyncHandler} from "../utils/asyncHandler.js"
+import {deleteCached} from "../utils/cache.js"
 
 
 const toggleSubscription = asyncHandler(async (req, res) => {
@@ -17,13 +18,22 @@ const toggleSubscription = asyncHandler(async (req, res) => {
     throw new ApiError(400, "You cannot subscribe to yourself");
   }
 
+  // Toggling changes the channel's subscribersCount, which is part of the
+  // cached channel-profile data - so that cache entry needs to be cleared
+  // either way this turns out.
+  const channelUser = await User.findById(channelId).select("username");
+
   const alreadySubscribed = await Subscription.findOne({
     subscriber: req.user?._id,
-    channel: channelId,        
+    channel: channelId,
   });
 
   if (alreadySubscribed) {
     await Subscription.findByIdAndDelete(alreadySubscribed._id);
+
+    if (channelUser) {
+      await deleteCached(`channel:${channelUser.username}`);
+    }
 
     return res
       .status(200)
@@ -36,10 +46,19 @@ const toggleSubscription = asyncHandler(async (req, res) => {
       );
   }
 
-  await Subscription.create({
-    subscriber: req.user?._id, 
-    channel: channelId,        
-  });
+  try {
+    await Subscription.create({
+      subscriber: req.user?._id,
+      channel: channelId,
+    });
+  } catch (error) {
+    // A concurrent request already created this subscription (caught by the unique index) - treat as success
+    if (error.code !== 11000) throw error;
+  }
+
+  if (channelUser) {
+    await deleteCached(`channel:${channelUser.username}`);
+  }
 
   return res
     .status(200)

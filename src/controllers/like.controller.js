@@ -32,10 +32,15 @@ const toggleVideoLike = asyncHandler(async (req, res) => {
       .json(new ApiResponse(200, { isLiked: false }, "Unliked successfully"));
   }
 
-  await Like.create({
-    video: videoId,
-    likedBy: req.user?._id,
-  });
+  try {
+    await Like.create({
+      video: videoId,
+      likedBy: req.user?._id,
+    });
+  } catch (error) {
+    // A concurrent request already created this like (caught by the unique index) - treat as success
+    if (error.code !== 11000) throw error;
+  }
 
   return res
     .status(200)
@@ -67,10 +72,15 @@ const toggleCommentLike = asyncHandler(async (req, res) => {
       .json(new ApiResponse(200, { isLiked: false }, "Unliked successfully"));
   }
 
-  await Like.create({
-    comment: commentId,
-    likedBy: req.user?._id,
-  });
+  try {
+    await Like.create({
+      comment: commentId,
+      likedBy: req.user?._id,
+    });
+  } catch (error) {
+    // A concurrent request already created this like (caught by the unique index) - treat as success
+    if (error.code !== 11000) throw error;
+  }
 
   return res
     .status(200)
@@ -102,10 +112,15 @@ const toggleTweetLike = asyncHandler(async (req, res) => {
       .json(new ApiResponse(200, { isLiked: false }, "Unliked successfully"));
   }
 
-  await Like.create({
-    tweet: tweetId,
-    likedBy: req.user?._id,
-  });
+  try {
+    await Like.create({
+      tweet: tweetId,
+      likedBy: req.user?._id,
+    });
+  } catch (error) {
+    // A concurrent request already created this like (caught by the unique index) - treat as success
+    if (error.code !== 11000) throw error;
+  }
 
   return res
     .status(200)

@@ -3,8 +3,10 @@ import mongoose from "mongoose";
 import { ApiError } from "../utils/ApiError.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { User } from "../models/user.model.js";
+import { Subscription } from "../models/subscription.model.js";
 import { uploadOnCloudinary } from "../utils/cloudinary.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
+import { getCached, setCached, deleteCached } from "../utils/cache.js";
 
 const generateAccessAndRefereshTokens = async(userId) =>{
     try {
@@ -251,8 +253,10 @@ const updateAccountDetails = asyncHandler(async(req, res) => {
             }
         },
         {new: true}
-        
+
     ).select("-password")
+
+    await deleteCached(`channel:${user.username}`)
 
     return res
     .status(200)
@@ -266,7 +270,6 @@ const updateUserAvatar = asyncHandler(async(req, res) => {
         throw new ApiError(400, "Avatar file is missing")
     }
 
-    //TODO: delete old image - assignment
 
     const avatar = await uploadOnCloudinary(avatarLocalPath)
 
@@ -285,6 +288,8 @@ const updateUserAvatar = asyncHandler(async(req, res) => {
         {new: true}
     ).select("-password")
 
+    await deleteCached(`channel:${user.username}`)
+
     return res
     .status(200)
     .json(
@@ -298,8 +303,6 @@ const updateUserCoverImage = asyncHandler(async(req, res) => {
     if (!coverImageLocalPath) {
         throw new ApiError(400, "Cover image file is missing")
     }
-
-    //TODO: delete old image - assignment
 
 
     const coverImage = await uploadOnCloudinary(coverImageLocalPath)
@@ -319,6 +322,8 @@ const updateUserCoverImage = asyncHandler(async(req, res) => {
         {new: true}
     ).select("-password")
 
+    await deleteCached(`channel:${user.username}`)
+
     return res
     .status(200)
     .json(
@@ -333,68 +338,77 @@ const getUserChannelProfile = asyncHandler(async(req, res) => {
         throw new ApiError(400, "username is missing")
     }
 
-    const channel = await User.aggregate([
-        {
-            $match: {
-                username: username?.toLowerCase()
-            }
-        },
-        {
-            $lookup: {
-                from: "subscriptions",
-                localField: "_id",
-                foreignField: "channel",
-                as: "subscribers"
-            }
-        },
-        {
-            $lookup: {
-                from: "subscriptions",
-                localField: "_id",
-                foreignField: "subscriber",
-                as: "subscribedTo"
-            }
-        },
-        {
-            $addFields: {
-                subscribersCount: {
-                    $size: "$subscribers"
-                },
-                channelsSubscribedToCount: {
-                    $size: "$subscribedTo"
-                },
-                isSubscribed: {
-                    $cond: {
-                        if: {$in: [req.user?._id, "$subscribers.subscriber"]},
-                        then: true,
-                        else: false
+    const normalizedUsername = username.toLowerCase()
+    const cacheKey = `channel:${normalizedUsername}`
+
+    // Shared part - same for every viewer, so it's safe to cache. Deliberately
+    // excludes isSubscribed, which depends on who's asking.
+    let channelData = await getCached(cacheKey)
+
+    if (!channelData) {
+        const channel = await User.aggregate([
+            {
+                $match: {
+                    username: normalizedUsername
+                }
+            },
+            {
+                $lookup: {
+                    from: "subscriptions",
+                    localField: "_id",
+                    foreignField: "channel",
+                    as: "subscribers"
+                }
+            },
+            {
+                $lookup: {
+                    from: "subscriptions",
+                    localField: "_id",
+                    foreignField: "subscriber",
+                    as: "subscribedTo"
+                }
+            },
+            {
+                $addFields: {
+                    subscribersCount: {
+                        $size: "$subscribers"
+                    },
+                    channelsSubscribedToCount: {
+                        $size: "$subscribedTo"
                     }
                 }
+            },
+            {
+                $project: {
+                    fullName: 1,
+                    username: 1,
+                    subscribersCount: 1,
+                    channelsSubscribedToCount: 1,
+                    avatar: 1,
+                    coverImage: 1,
+                    email: 1
+                }
             }
-        },
-        {
-            $project: {
-                fullName: 1,
-                username: 1,
-                subscribersCount: 1,
-                channelsSubscribedToCount: 1,
-                isSubscribed: 1,
-                avatar: 1,
-                coverImage: 1,
-                email: 1
+        ])
 
-            }
+        if (!channel?.length) {
+            throw new ApiError(404, "channel does not exists")
         }
-    ])
 
-    if (!channel?.length) {
-        throw new ApiError(404, "channel does not exists")
+        channelData = channel[0]
+
+        await setCached(cacheKey, channelData, 60)
     }
+
+    // Personal part - never cached, always computed fresh for whoever is asking.
+    const isSubscribed = req.user
+        ? Boolean(await Subscription.exists({ subscriber: req.user._id, channel: channelData._id }))
+        : false
 
     return res
     .status(200)
     .json(
-        new ApiResponse(200, channel[0], "User channel fetched successfully")
+        new ApiResponse(200, { ...channelData, isSubscribed }, "User channel fetched successfully")
     )
 })
 

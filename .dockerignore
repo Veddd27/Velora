@@ -1,0 +1,13 @@
+# node_modules gets reinstalled fresh inside the image (matching the image's
+# own OS/architecture) - copying your local one in would just cause bugs.
+node_modules
+
+# .env holds real secrets (DB credentials, API keys). It should never be
+# baked into an image - images can be inspected or shared, so secrets get
+# injected at container start time instead (see docker-compose.yml).
+.env
+
+.git
+.gitignore
+Readme.md
+postman

@@ -11,5 +11,7 @@ const tweetSchema = new Schema({
     }
 }, {timestamps: true})
 
+// Serves getUserTweets: fetch all tweets by one user, newest first
+tweetSchema.index({ owner: 1, createdAt: -1 })
 
 export const Tweet = mongoose.model("Tweet", tweetSchema)

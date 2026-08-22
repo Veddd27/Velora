@@ -9,7 +9,13 @@ function ensureCloudinaryConfig() {
     })
 }
 
-const uploadOnCloudinary = async (localFilePath) => {
+// cleanupLocalFile controls whether this function deletes the local temp
+// file itself. Callers that only ever try once (register, avatar update,
+// etc.) want the default (true) - clean up immediately either way. Callers
+// that might RETRY the same upload (the BullMQ video worker) need to pass
+// false, since deleting the file after a failed attempt would make every
+// retry fail immediately too, just for a different reason (no file to read).
+const uploadOnCloudinary = async (localFilePath, cleanupLocalFile = true) => {
     try {
         if (!localFilePath) return null
 
@@ -19,12 +25,12 @@ const uploadOnCloudinary = async (localFilePath) => {
             resource_type: "auto"
         })
         console.log("File uploaded to Cloudinary:", response.url)
-        fs.unlinkSync(localFilePath)
+        if (cleanupLocalFile) fs.unlinkSync(localFilePath)
         return response
 
     } catch (error) {
         console.error("Cloudinary upload failed:", error.message)
-        if (fs.existsSync(localFilePath)) {
+        if (cleanupLocalFile && fs.existsSync(localFilePath)) {
             fs.unlinkSync(localFilePath)
         }
         return null

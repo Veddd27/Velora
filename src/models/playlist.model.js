@@ -21,6 +21,7 @@ const playlistSchema = new Schema({
     },
 }, {timestamps: true})
 
-
+// Serves getUserPlaylists: fetch all playlists owned by one user
+playlistSchema.index({ owner: 1 })
 
 export const Playlist = mongoose.model("Playlist", playlistSchema)

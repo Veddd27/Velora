@@ -1,14 +1,29 @@
 import mongoose, {isValidObjectId} from "mongoose"
 import {Video} from "../models/video.model.js"
 import {User} from "../models/user.model.js"
+import {Like} from "../models/like.model.js"
+import {Subscription} from "../models/subscription.model.js"
 import {ApiError} from "../utils/ApiError.js"
 import {ApiResponse} from "../utils/ApiResponse.js"
 import {asyncHandler} from "../utils/asyncHandler.js"
 import {uploadOnCloudinary} from "../utils/cloudinary.js"
+import {getCached, setCached, deleteCached} from "../utils/cache.js"
+import {videoQueue} from "../queues/video.queue.js"
 
 
 const getAllVideos = asyncHandler(async (req, res) => {
   const { page = 1, limit = 10, query, sortBy, sortType, userId } = req.query;
+
+  // The feed doesn't depend on who's asking, so the whole response can be cached
+  // as one shared answer per distinct combination of filters.
+  const cacheKey = `feed:page=${page}:limit=${limit}:query=${query || ""}:sortBy=${sortBy || ""}:sortType=${sortType || ""}:userId=${userId || ""}`;
+
+  const cachedVideos = await getCached(cacheKey);
+  if (cachedVideos) {
+    return res
+      .status(200)
+      .json(new ApiResponse(200, cachedVideos, "Videos fetched successfully"));
+  }
 
   const pipeline = [];
 
@@ -77,6 +92,11 @@ const getAllVideos = asyncHandler(async (req, res) => {
 
   const videos = await Video.aggregatePaginate(videoAggregate, options);
 
+  // Short TTL: a newly published video may take up to a minute to show up in
+  // cached feed pages - an acceptable tradeoff since re-checking on every
+  // request would defeat the point of caching the feed at all.
+  await setCached(cacheKey, videos, 60);
+
   return res
     .status(200)
     .json(new ApiResponse(200, videos, "Videos fetched successfully"));
@@ -100,38 +120,50 @@ const publishAVideo = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Thumbnail is required");
   }
 
-  // Upload to Cloudinary
-  // Cloudinary's response includes a `duration` field for videos
-  const videoFile = await uploadOnCloudinary(videoFileLocalPath);
-  const thumbnail = await uploadOnCloudinary(thumbnailLocalPath);
-
-  if (!videoFile) {
-    throw new ApiError(400, "Video file upload failed");
-  }
-  if (!thumbnail) {
-    throw new ApiError(400, "Thumbnail upload failed");
-  }
-
-  // Create the video document
+  // Create the video record right away, in a "processing" state - notice
+  // there's no Cloudinary upload happening on this request at all anymore.
+  // videoFile/thumbnail/duration get filled in later by the worker.
   const video = await Video.create({
-    videoFile: videoFile.secure_url,
-    thumbnail: thumbnail.secure_url,
     title,
     description,
-    duration: videoFile.duration, 
-    owner: req.user?._id,         
-    isPublished: false,           
+    owner: req.user?._id,
+    isPublished: false,
+    status: "processing",
   });
 
-  const createdVideo = await Video.findById(video._id);
+  // Hand the slow work off to the queue instead of doing it here. This one
+  // line is the entire point of this feature: the request can respond right
+  // now instead of the browser sitting there for however long Cloudinary
+  // takes to ingest a large video file. The worker (running as its own
+  // separate process - see src/workers/video.worker.js) will pick this job
+  // up independently, whenever it's free, and do the actual upload.
+  await videoQueue.add(
+    "process-video",
+    {
+      videoId: video._id.toString(),
+      videoFileLocalPath,
+      thumbnailLocalPath,
+    },
+    {
+      // If the worker crashes or Cloudinary has a transient failure, retry
+      // this job automatically instead of losing it - up to 3 tries total,
+      // waiting longer between each retry (5s, then 10s, then 20s).
+      attempts: 3,
+      backoff: { type: "exponential", delay: 5000 },
+    }
+  );
 
-  if (!createdVideo) {
-    throw new ApiError(500, "Something went wrong while publishing the video");
-  }
-
+  // 202 Accepted (not 201 Created) - this signals "your request was valid
+  // and accepted, but the actual work isn't finished yet."
   return res
-    .status(201)
-    .json(new ApiResponse(201, createdVideo, "Video published successfully"));
+    .status(202)
+    .json(
+      new ApiResponse(
+        202,
+        video,
+        "Video upload received - processing in the background"
+      )
+    );
 })
 
 const getVideoById = asyncHandler(async (req, res) => {
@@ -141,91 +173,110 @@ const getVideoById = asyncHandler(async (req, res) => {
     throw new ApiError(400, "Invalid videoId");
   }
 
-  const video = await Video.aggregate([
-    {
-      $match: {
-        _id: new mongoose.Types.ObjectId(videoId),
-      },
-    },
-    {
-      $lookup: {
-        from: "likes",
-        localField: "_id",
-        foreignField: "video",
-        as: "likes",
-      },
-    },
-    {
-      $lookup: {
-        from: "users",
-        localField: "owner",
-        foreignField: "_id",
-        as: "owner",
-        pipeline: [
-          {
-            $lookup: {
-              from: "subscriptions",
-              localField: "_id",
-              foreignField: "channel",
-              as: "subscribers",
-            },
-          },
-          {
-            $addFields: {
-              subscribersCount: { $size: "$subscribers" },
-              isSubscribed: {
-                $cond: {
-                  if: { $in: [req.user?._id, "$subscribers.subscriber"] },
-                  then: true,
-                  else: false,
-                },
-              },
-            },
-          },
-          {
-            $project: {
-              username: 1,
-              avatar: 1,
-              subscribersCount: 1,
-              isSubscribed: 1,
-            },
-          },
-        ],
-      },
-    },
-    {
-      $addFields: {
-        likesCount: { $size: "$likes" },
-        owner: { $first: "$owner" },
-        isLiked: {
-          $cond: {
-            if: { $in: [req.user?._id, "$likes.likedBy"] },
-            then: true,
-            else: false,
-          },
+  const cacheKey = `video:${videoId}`;
+
+  // This is the part that's the same for every viewer, so it's safe to share
+  // across everyone via the cache - it deliberately does NOT include isLiked
+  // or isSubscribed, since those depend on who's asking.
+  let videoData = await getCached(cacheKey);
+
+  if (!videoData) {
+    const video = await Video.aggregate([
+      {
+        $match: {
+          _id: new mongoose.Types.ObjectId(videoId),
         },
       },
-    },
-    {
-      $project: {
-        videoFile: 1,
-        thumbnail: 1,
-        title: 1,
-        description: 1,
-        views: 1,
-        createdAt: 1,
-        duration: 1,
-        comments: 1,
-        owner: 1,
-        likesCount: 1,
-        isLiked: 1,
+      {
+        $lookup: {
+          from: "likes",
+          localField: "_id",
+          foreignField: "video",
+          as: "likes",
+        },
       },
-    },
-  ]);
+      {
+        $lookup: {
+          from: "users",
+          localField: "owner",
+          foreignField: "_id",
+          as: "owner",
+          pipeline: [
+            {
+              $lookup: {
+                from: "subscriptions",
+                localField: "_id",
+                foreignField: "channel",
+                as: "subscribers",
+              },
+            },
+            {
+              $addFields: {
+                subscribersCount: { $size: "$subscribers" },
+              },
+            },
+            {
+              $project: {
+                username: 1,
+                avatar: 1,
+                subscribersCount: 1,
+              },
+            },
+          ],
+        },
+      },
+      {
+        $addFields: {
+          likesCount: { $size: "$likes" },
+          owner: { $first: "$owner" },
+        },
+      },
+      {
+        $project: {
+          videoFile: 1,
+          thumbnail: 1,
+          title: 1,
+          description: 1,
+          views: 1,
+          createdAt: 1,
+          duration: 1,
+          comments: 1,
+          owner: 1,
+          likesCount: 1,
+        },
+      },
+    ]);
 
-  if (!video?.length) {
-    throw new ApiError(404, "Video not found");
+    if (!video?.length) {
+      throw new ApiError(404, "Video not found");
+    }
+
+    videoData = video[0];
+
+    // Short TTL: like/view counts drift slightly stale between requests,
+    // which is an acceptable tradeoff for not re-running this aggregation
+    // on every single view.
+    await setCached(cacheKey, videoData, 60);
   }
+
+  // The personal part: never cached, always computed fresh for whoever is asking.
+  const isLiked = req.user
+    ? Boolean(await Like.exists({ video: videoId, likedBy: req.user._id }))
+    : false;
+  const isSubscribed = req.user
+    ? Boolean(
+        await Subscription.exists({
+          subscriber: req.user._id,
+          channel: videoData.owner._id,
+        })
+      )
+    : false;
+
+  const responseVideo = {
+    ...videoData,
+    isLiked,
+    owner: { ...videoData.owner, isSubscribed },
+  };
 
   const hasWatched = req.user?.watchHistory?.some(
     (id) => id.toString() === videoId.toString()
@@ -242,14 +293,12 @@ const getVideoById = asyncHandler(async (req, res) => {
       });
     }
 
-    if (video[0]) {
-      video[0].views = (video[0].views || 0) + 1;
-    }
+    responseVideo.views = (responseVideo.views || 0) + 1;
   }
 
   return res
     .status(200)
-    .json(new ApiResponse(200, video[0], "Video details fetched successfully"));
+    .json(new ApiResponse(200, responseVideo, "Video details fetched successfully"));
 });
 
 const updateVideo = asyncHandler(async (req, res) => {
@@ -299,8 +348,10 @@ const updateVideo = asyncHandler(async (req, res) => {
         ...thumbnailUpdate,
       },
     },
-    { new: true } 
+    { new: true }
   );
+
+  await deleteCached(`video:${videoId}`);
 
   return res
     .status(200)
@@ -327,6 +378,7 @@ const deleteVideo = asyncHandler(async (req, res) => {
 
   // Delete the video document
   await Video.findByIdAndDelete(videoId);
+  await deleteCached(`video:${videoId}`);
   return res
     .status(200)
     .json(new ApiResponse(200, {}, "Video deleted successfully"));
@@ -350,7 +402,13 @@ const togglePublishStatus = asyncHandler(async (req, res) => {
   if (video?.owner.toString() !== req.user?._id.toString()) {
     throw new ApiError(403, "You are not allowed to toggle this video");
   }
-  
+
+  // Can't publish a video that the background worker hasn't finished
+  // uploading yet - there'd be no actual videoFile/thumbnail to show.
+  if (!video.isPublished && video.status !== "ready") {
+    throw new ApiError(400, "Video is still processing and cannot be published yet");
+  }
+
   const toggledVideo = await Video.findByIdAndUpdate(
     videoId,
     {
@@ -360,6 +418,8 @@ const togglePublishStatus = asyncHandler(async (req, res) => {
     },
     { new: true }
   );
+
+  await deleteCached(`video:${videoId}`);
 
   return res
     .status(200)

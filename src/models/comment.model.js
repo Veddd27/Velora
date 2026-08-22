@@ -24,4 +24,7 @@ const commentSchema = new Schema(
 
 commentSchema.plugin(mongooseAggregatePaginate)
 
+// Serves getVideoComments: fetch + paginate comments for one video, newest first
+commentSchema.index({ video: 1, createdAt: -1 })
+
 export const Comment = mongoose.model("Comment", commentSchema)

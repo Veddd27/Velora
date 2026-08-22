@@ -1,0 +1,46 @@
+# One file, one command ("docker compose up") to start everything below
+# together, correctly wired to talk to each other. MongoDB isn't listed here
+# on purpose - it's a cloud (Atlas) database, so containers just reach out to
+# it over the internet using the existing MONGODB_URI from .env.
+
+services:
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    # "build: ." means: use the Dockerfile in this folder to build an image,
+    # rather than pulling a pre-made one (like we do for redis above).
+    build: .
+    ports:
+      # "host_port:container_port" - the container always listens on 8000
+      # internally; the LEFT number is what you actually hit from outside.
+      # Using 8001 here for now since port 8000 is already in use by a
+      # locally-running node process on this machine - change this back to
+      # "8000:8000" once you're only running the app via Docker.
+      - "8001:8000"
+    # Loads all your existing secrets (Mongo URI, JWT secrets, Cloudinary
+    # keys, etc.) from .env at container start time - NOT baked into the image.
+    env_file:
+      - .env
+    environment:
+      # Overrides just this one value from .env. Containers can't reach each
+      # other via "localhost" - each container is its own isolated box.
+      # Docker Compose lets containers find each other BY SERVICE NAME
+      # instead, so "redis" here resolves to the redis container above.
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
+
+  worker:
+    # Reuses the exact same image/Dockerfile as api - it's the same
+    # application code, just started with a different command below.
+    build: .
+    command: node -r dotenv/config --experimental-json-modules src/workers/video.worker.js
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379
+    depends_on:
+      - redis
